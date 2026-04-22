@@ -1,6 +1,6 @@
 import ex1_check
-import TA.AI.Semester_B.Assignments.Assignment1.publish_files.search as search
-import TA.AI.Semester_B.Assignments.Assignment1.publish_files.utils as utils
+import search as search
+import utils as utils
 
 id = ["No numbers - I'm special!"]
 

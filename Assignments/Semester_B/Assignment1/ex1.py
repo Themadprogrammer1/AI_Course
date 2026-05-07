@@ -60,6 +60,17 @@ class ElevatorsProblem(search.Problem):
                     break
             self.needs_transfer[p_id] = not can_direct
 
+        self.useful_floors_for = {}
+        for p_id in self.p_ids:
+            goal_f = self.person_specs[p_id]["goal"]
+            useful = {goal_f}
+            goal_els = set(self.goal_elevators[p_id])
+            for e_id in self.e_ids:
+                if e_id not in goal_els:
+                    for g_el in goal_els:
+                        useful.update(self.intersections.get((e_id, g_el), set()))
+            self.useful_floors_for[p_id] = frozenset(useful)
+
         initial_weights = [0] * len(self.e_ids)
         search.Problem.__init__(self, State(initial_elevators, initial_persons, initial_weights))
 
@@ -81,10 +92,10 @@ class ElevatorsProblem(search.Problem):
                     return [(f"EXIT{{{p_id},{e_id}}}", State(e_pos, new_p_pos, new_weights))]
 
         successors = []
-        waiting_floors = set()
+        waiting_people = []
         for i, p_id in enumerate(self.p_ids):
             if isinstance(p_pos[i], int) and p_pos[i] != self.person_specs[p_id]["goal"]:
-                waiting_floors.add(p_pos[i])
+                waiting_people.append((i, p_id, p_pos[i]))
 
         for i, e_id in enumerate(self.e_ids):
             curr_f = e_pos[i]
@@ -92,16 +103,20 @@ class ElevatorsProblem(search.Problem):
             
             targets = set()
             if not passengers:
-                targets = waiting_floors & self.elevator_specs[e_id]["reachable"]
+                for _, p_id, p_f in waiting_people:
+                    if p_f in self.elevator_specs[e_id]["reachable"]:
+                        if any(f in self.elevator_specs[e_id]["reachable"] for f in self.useful_floors_for[p_id]):
+                            targets.add(p_f)
             else:
                 for k in passengers:
-                    p_goal = self.person_specs[self.p_ids[k]]["goal"]
-                    if p_goal in self.elevator_specs[e_id]["reachable"]:
-                        targets.add(p_goal)
-                    else:
-                        for other_e in self.goal_elevators[self.p_ids[k]]:
-                            targets.update(self.intersections.get((e_id, other_e), set()))
-                targets.update(waiting_floors & self.elevator_specs[e_id]["reachable"])
+                    p_id = self.p_ids[k]
+                    for f in self.useful_floors_for[p_id]:
+                        if f in self.elevator_specs[e_id]["reachable"]:
+                            targets.add(f)
+                for _, p_id, p_f in waiting_people:
+                    if p_f in self.elevator_specs[e_id]["reachable"]:
+                        if any(f in self.elevator_specs[e_id]["reachable"] for f in self.useful_floors_for[p_id]):
+                            targets.add(p_f)
 
             for t_f in targets:
                 if t_f != curr_f:
@@ -119,24 +134,22 @@ class ElevatorsProblem(search.Problem):
                 for j, e_id in enumerate(self.e_ids):
                     if e_pos[j] == p_loc:
                         if e_weights[j] + p_weight <= self.elevator_specs[e_id]["max_weight"]:
-                            new_p_pos = list(p_pos)
-                            new_p_pos[i] = f"e{e_id}"
-                            new_weights = list(e_weights)
-                            new_weights[j] += p_weight
-                            successors.append((f"ENTER{{{p_id},{e_id}}}", State(e_pos, new_p_pos, new_weights)))
+                            if any(f in self.elevator_specs[e_id]["reachable"] for f in self.useful_floors_for[p_id]):
+                                new_p_pos = list(p_pos)
+                                new_p_pos[i] = f"e{e_id}"
+                                new_weights = list(e_weights)
+                                new_weights[j] += p_weight
+                                successors.append((f"ENTER{{{p_id},{e_id}}}", State(e_pos, new_p_pos, new_weights)))
             else:
                 e_id = int(p_loc[1:])
                 e_idx = self.e_ids.index(e_id)
                 curr_f = e_pos[e_idx]
-                p_goal = self.person_specs[p_id]["goal"]
-                if p_goal not in self.elevator_specs[e_id]["reachable"]:
-                    for other_e in self.goal_elevators[p_id]:
-                        if curr_f in self.elevator_specs[other_e]["reachable"]:
-                            new_p_pos = list(p_pos)
-                            new_p_pos[i] = curr_f
-                            new_weights = list(e_weights)
-                            new_weights[e_idx] -= p_weight
-                            successors.append((f"EXIT{{{p_id},{e_id}}}", State(e_pos, new_p_pos, new_weights)))
+                if curr_f in self.useful_floors_for[p_id]:
+                    new_p_pos = list(p_pos)
+                    new_p_pos[i] = curr_f
+                    new_weights = list(e_weights)
+                    new_weights[e_idx] -= p_weight
+                    successors.append((f"EXIT{{{p_id},{e_id}}}", State(e_pos, new_p_pos, new_weights)))
         return successors
 
     def goal_test(self, state):

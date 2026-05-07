@@ -43,6 +43,16 @@ class ElevatorsProblem(search.Problem):
 
     def successor(self, state):
         successors = []
+        for i, p_id in enumerate(self.p_ids):
+            p_loc = state.personsPosition[i]
+            if not isinstance(p_loc, int):
+                e_id = int(p_loc[1:])
+                e_idx = self.e_ids.index(e_id)
+                if state.elevatorsPosition[e_idx] == self.person_specs[p_id]["goal"]:
+                    new_p_pos = list(state.personsPosition)
+                    new_p_pos[i] = state.elevatorsPosition[e_idx]
+                    return [(f"EXIT{{{p_id},{e_id}}}", State(state.elevatorsPosition, new_p_pos))]
+
         for i, e_id in enumerate(self.e_ids):
             curr_f = state.elevatorsPosition[i]
             for target_f in self.elevator_specs[e_id]["reachable"]:
@@ -50,8 +60,12 @@ class ElevatorsProblem(search.Problem):
                     new_e_pos = list(state.elevatorsPosition)
                     new_e_pos[i] = target_f
                     successors.append((f"MOVE{{{e_id},{target_f}}}", State(new_e_pos, state.personsPosition)))
+
         for i, p_id in enumerate(self.p_ids):
             p_loc = state.personsPosition[i]
+            if p_loc == self.person_specs[p_id]["goal"]:
+                continue
+            
             p_weight = self.person_specs[p_id]["weight"]
             if isinstance(p_loc, int):
                 for j, e_id in enumerate(self.e_ids):
@@ -81,11 +95,16 @@ class ElevatorsProblem(search.Problem):
 
     def h_astar(self, node):
         state = node.state
-        count = 0
+        cost = 0
         for i, p_id in enumerate(self.p_ids):
-            if state.personsPosition[i] != self.person_specs[p_id]["goal"]:
-                count += 1
-        return count
+            p_loc = state.personsPosition[i]
+            goal = self.person_specs[p_id]["goal"]
+            if p_loc != goal:
+                if isinstance(p_loc, int):
+                    cost += 3
+                else:
+                    cost += 2
+        return cost
 
 
 def create_elevators_problem(game):

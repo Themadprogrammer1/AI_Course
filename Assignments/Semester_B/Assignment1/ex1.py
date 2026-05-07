@@ -80,7 +80,12 @@ class ElevatorsProblem(search.Problem):
         return True
 
     def h_astar(self, node):
-        return 0
+        state = node.state
+        count = 0
+        for i, p_id in enumerate(self.p_ids):
+            if state.personsPosition[i] != self.person_specs[p_id]["goal"]:
+                count += 1
+        return count
 
 
 def create_elevators_problem(game):

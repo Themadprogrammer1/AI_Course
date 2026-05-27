@@ -14,13 +14,17 @@ id = ["212412258"]
 class State:
     """
     Represents a state in the Elevators problem.
+    
     To ensure hashability and efficiency, positions are stored as immutable tuples.
-    Persons who have reached their goal are physically removed from the state to 
-    reduce the search space.
+    Performance Optimizations:
+    - Persons who have reached their goal are physically removed from the state 
+      to shrink the search space.
+    - personsPosition is stored as a sorted tuple of (p_id, location) to maintain 
+      a consistent hash regardless of the order people are processed.
     """
     def __init__(self, elevatorsPosition, personsPosition, elevatorWeights):
         self.elevatorsPosition = tuple(elevatorsPosition)
-        # personsPosition is a tuple of (p_id, location) sorted for consistent hashing
+        # Sort by person ID to ensure identical physical states have the same hash
         self.personsPosition = tuple(sorted(personsPosition))
         self.elevatorWeights = tuple(elevatorWeights)
 
@@ -39,18 +43,24 @@ class ElevatorsProblem(search.Problem):
         self.e_ids = tuple(sorted(initial["Elevators"].keys()))
         self.p_ids = tuple(sorted(initial["Persons"].keys()))
         
-        # 1. Initialize specifications and building structure
+        # 1. Initialize specifications (reachability, weight limits, intersections)
         self._initialize_specs(initial)
         
-        # 2. Pre-calculate the Minimum Transfers Matrix using DP
-        self._precompute_min_transfers()
+        # 2. Pre-calculate Weight-Aware Minimum Transfers Matrices.
+        #    Calculating a separate matrix for each weight class ensures that 
+        #    the heuristic and pruning logic respect physical weight limits.
+        self._precompute_all_min_transfers()
         
-        # 3. Create the initial state
+        # 3. Pre-calculate best transfers from each elevator to each goal.
+        #    This moves expensive min() calculations out of the h_astar hot loop.
+        self._precompute_best_elevator_transfers()
+        
+        # 4. Create the initial state
         initial_elevators = [initial["Elevators"][e_id][0] for e_id in self.e_ids]
         initial_persons = []
         for p_id in self.p_ids:
             start_f = initial["Persons"][p_id][0]
-            # Only track persons who haven't reached their goal yet
+            # State Dumping: Don't track people who are already at their goal
             if start_f != self.person_specs[p_id]["goal"]:
                 initial_persons.append((p_id, start_f))
                 
@@ -59,7 +69,7 @@ class ElevatorsProblem(search.Problem):
         search.Problem.__init__(self, State(initial_elevators, initial_persons, initial_weights))
 
     def _initialize_specs(self, initial):
-        """Extracts elevator and person properties from the initial dictionary."""
+        """Parses the problem description into efficient lookup structures."""
         self.elevator_specs = {}
         for e_id in self.e_ids:
             curr_f, reach, weight = initial["Elevators"][e_id]
@@ -76,46 +86,73 @@ class ElevatorsProblem(search.Problem):
                 "goal": goal_f
             }
 
-        # Identify floors where transfers can occur (intersections of elevator ranges)
+        # Pre-identify intersection floors to facilitate transfers
         self.intersections = set()
         for i, e1_id in enumerate(self.e_ids):
             for e2_id in self.e_ids[i+1:]:
                 inter = self.elevator_specs[e1_id]["reachable"] & self.elevator_specs[e2_id]["reachable"]
                 self.intersections.update(inter)
 
-    def _precompute_min_transfers(self):
+    def _precompute_all_min_transfers(self):
+        """Computes a unique min_transfers matrix for every unique passenger weight."""
+        unique_weights = set(p["weight"] for p in self.person_specs.values())
+        self.weight_to_matrix = {}
+        for w in unique_weights:
+            self.weight_to_matrix[w] = self._compute_matrix_for_weight(w)
+
+    def _compute_matrix_for_weight(self, weight):
         """
-        Uses an iterative DP approach (Floyd-Warshall) to compute a matrix 
-        representing the minimum number of transfers needed between any two floors.
-        Like in Algo1
+        Computes the min transfers matrix using only elevators capable of 
+        carrying the specified weight. Uses Floyd-Warshall with early stopping.
         """
         floors = list(range(self.height + 1))
-        # Initialize matrix with infinity
-        self.min_transfers = {i: {j: float('inf') for j in floors} for i in floors}
+        matrix = {i: {j: float('inf') for j in floors} for i in floors}
         
         for i in floors:
-            self.min_transfers[i][i] = 0
+            matrix[i][i] = 0
             
-        # Floors reachable by the same elevator have 0 transfers between them
-        for e_id in self.e_ids:
+        # Filter for elevators that can physically handle this weight
+        capable_elevators = [e_id for e_id in self.e_ids if self.elevator_specs[e_id]["max_weight"] >= weight]
+        
+        for e_id in capable_elevators:
             reach = list(self.elevator_specs[e_id]["reachable"])
             for f1 in reach:
                 for f2 in reach:
-                    self.min_transfers[f1][f2] = 0
+                    matrix[f1][f2] = 0
         
-        # Iteratively update paths until convergence
         while True:
             changed = False
             for k in floors:
+                # Optimization: skip intermediate floors that are unreachable
+                if all(matrix[i][k] == float('inf') for i in floors): continue
                 for i in floors:
-                    if self.min_transfers[i][k] == float('inf'): continue
+                    if matrix[i][k] == float('inf'): continue
                     for j in floors:
-                        new_t = self.min_transfers[i][k] + self.min_transfers[k][j] + 1
-                        if new_t < self.min_transfers[i][j]:
-                            self.min_transfers[i][j] = new_t
+                        new_t = matrix[i][k] + matrix[k][j] + 1
+                        if new_t < matrix[i][j]:
+                            matrix[i][j] = new_t
                             changed = True
             if not changed:
                 break
+        return matrix
+
+    def _precompute_best_elevator_transfers(self):
+        """Pre-calculates the optimal transfer points for the heuristic function."""
+        self.best_transfer_from_e = {} # Key: (e_id, weight, goal)
+        all_goals = set(self.person_specs[p]["goal"] for p in self.p_ids)
+        unique_weights = set(p["weight"] for p in self.person_specs.values())
+        
+        for e_id in self.e_ids:
+            self.best_transfer_from_e[e_id] = {}
+            reach = self.elevator_specs[e_id]["reachable"]
+            for w in unique_weights:
+                if self.elevator_specs[e_id]["max_weight"] < w: continue
+                
+                self.best_transfer_from_e[e_id][w] = {}
+                matrix = self.weight_to_matrix[w]
+                for goal in all_goals:
+                    # Minimum transfers remaining from any floor this elevator can reach
+                    self.best_transfer_from_e[e_id][w][goal] = min(matrix[f][goal] for f in reach)
 
     def successor(self, state):
         p_pos = state.personsPosition
@@ -123,14 +160,12 @@ class ElevatorsProblem(search.Problem):
         e_weights = state.elevatorWeights
 
         # 1. MANDATORY EXIT PRUNING:
-        # If a person is inside an elevator that is stopped at their goal floor,
-        # they MUST exit. This is the only successor for this state.
+        # If a person can exit at their goal, they must. Return as the only successor.
         for p_id, p_loc in p_pos:
-            if isinstance(p_loc, str): # In elevator (e.g., 'e0')
+            if isinstance(p_loc, str): 
                 e_id = int(p_loc[1:])
                 e_idx = self.e_ids.index(e_id)
                 if e_pos[e_idx] == self.person_specs[p_id]["goal"]:
-                    # Physically remove the person from the state upon EXITing at goal
                     new_p_pos = tuple(p for p in p_pos if p[0] != p_id)
                     new_weights = list(e_weights)
                     new_weights[e_idx] -= self.person_specs[p_id]["weight"]
@@ -138,30 +173,31 @@ class ElevatorsProblem(search.Problem):
 
         successors = []
 
-        # 2. SELECTIVE MOVE: 
-        # Restrict elevator movements to specific "Points of Interest" (POI).
+        # 2. SELECTIVE MOVE:
+        # Limit moves to floors with waiting people, passenger goals, or optimal intersections.
         for j, e_id in enumerate(self.e_ids):
             curr_f = e_pos[j]
             reach = self.elevator_specs[e_id]["reachable"]
             targets = set()
 
-            # POI 1: Floors with waiting people
+            # Pickup POIs
             for p_id, p_loc in p_pos:
                 if isinstance(p_loc, int) and p_loc in reach:
                     targets.add(p_loc)
             
-            # POI 2: Passenger destinations and optimal transfer points
+            # Destination and Transfer POIs
             for p_id, p_loc in p_pos:
                 if p_loc == f"e{e_id}":
                     goal = self.person_specs[p_id]["goal"]
                     if goal in reach:
                         targets.add(goal)
                     else:
-                        # Progress-Based Pruning: Only move to intersections that 
-                        # strictly reduce the remaining transfers for the passenger.
-                        curr_t = self.min_transfers[curr_f][goal]
+                        # Only move to intersections that bring this specific passenger closer to their goal
+                        p_weight = self.person_specs[p_id]["weight"]
+                        matrix = self.weight_to_matrix[p_weight]
+                        curr_t = matrix[curr_f][goal]
                         for f in self.intersections & reach:
-                            if self.min_transfers[f][goal] < curr_t:
+                            if matrix[f][goal] < curr_t:
                                 targets.add(f)
                         
             for t_f in targets:
@@ -174,21 +210,38 @@ class ElevatorsProblem(search.Problem):
         for p_id, p_loc in p_pos:
             p_weight = self.person_specs[p_id]["weight"]
             if isinstance(p_loc, int):
-                # Selective ENTER: Only enter if elevator can help progress towards goal
+                # Selective ENTER with Dynamic Capacity-Awareness:
                 goal = self.person_specs[p_id]["goal"]
-                curr_t = self.min_transfers[p_loc][goal]
+                matrix = self.weight_to_matrix[p_weight]
+                curr_t = matrix[p_loc][goal]
+                
+                # Check if a direct elevator is at the floor and has room
+                can_direct_with_cap = any(e_pos[k] == p_loc and goal in self.elevator_specs[eid]["reachable"] 
+                                          and e_weights[k] + p_weight <= self.elevator_specs[eid]["max_weight"]
+                                          for k, eid in enumerate(self.e_ids))
+                
                 for j, e_id in enumerate(self.e_ids):
                     if e_pos[j] == p_loc:
+                        if e_weights[j] + p_weight > self.elevator_specs[e_id]["max_weight"]:
+                            continue
+                            
                         reach = self.elevator_specs[e_id]["reachable"]
-                        can_help = (goal in reach) or any(self.min_transfers[f][goal] < curr_t for f in self.intersections & reach)
+                        is_direct = goal in reach
                         
-                        if can_help and e_weights[j] + p_weight <= self.elevator_specs[e_id]["max_weight"]:
+                        # Optimization: Skip transfer-elevators if a direct one is present with capacity
+                        if can_direct_with_cap and not is_direct:
+                            continue
+                            
+                        # Only enter if the elevator provides a path with the min transfers for this person
+                        can_help = is_direct or any(matrix[f][goal] < curr_t for f in self.intersections & reach)
+                        
+                        if can_help:
                             new_p_pos = tuple((pid, (f"e{e_id}" if pid == p_id else loc)) for pid, loc in p_pos)
                             new_weights = list(e_weights)
                             new_weights[j] += p_weight
                             successors.append((f"ENTER{{{p_id},{e_id}}}", State(e_pos, new_p_pos, tuple(new_weights))))
             else:
-                # EXIT at intersection (transfer point)
+                # Transfer EXIT: Exit at intersection points to switch elevators
                 e_id = int(p_loc[1:])
                 e_idx = self.e_ids.index(e_id)
                 curr_f = e_pos[e_idx]
@@ -201,14 +254,13 @@ class ElevatorsProblem(search.Problem):
         return successors
 
     def goal_test(self, state):
-        # State dumping ensures personsPosition is empty only when everyone reached their goal
+        # Goal is reached when the personsPosition tuple is empty due to physical dumping
         return len(state.personsPosition) == 0
 
     def h_astar(self, node):
         """
-        Admissible Heuristic:
-        Calculates the sum of unshareable actions (ENTERs and EXITs) based on 
-        the minimum transfers matrix, plus a shared move penalty (max_moves).
+        Admissible and highly informative heuristic based on weight-aware transfers.
+        Calculates exact ENTER/EXIT requirements + shared move penalties.
         """
         state = node.state
         unshareable = 0
@@ -216,35 +268,39 @@ class ElevatorsProblem(search.Problem):
         
         for p_id, p_loc in state.personsPosition:
             goal = self.person_specs[p_id]["goal"]
+            p_weight = self.person_specs[p_id]["weight"]
+            matrix = self.weight_to_matrix[p_weight]
             
             if isinstance(p_loc, int):
-                # Transfers required based on DP matrix
-                transfers = self.min_transfers[p_loc][goal]
-                unshareable += 2 * (transfers + 1) # Each ride requires ENTER and EXIT
+                # Calculate required ENTER/EXIT pairs based on min transfers
+                transfers = matrix[p_loc][goal]
+                if transfers == float('inf'): return float('inf') # Impossible goal
+                unshareable += 2 * (transfers + 1)
                 
-                # Check if an elevator is currently here to pick them up
+                # Check for elevator availability at the pickup floor
                 elevator_here = False
                 for j, e_id in enumerate(self.e_ids):
-                    if state.elevatorsPosition[j] == p_loc and p_loc in self.elevator_specs[e_id]["reachable"]:
+                    if state.elevatorsPosition[j] == p_loc and p_loc in self.elevator_specs[e_id]["reachable"] \
+                       and self.elevator_specs[e_id]["max_weight"] >= p_weight:
                         elevator_here = True
                         break
-                # If elevator here, 1 MOVE to target; else 2 MOVEs (one to pick up, one to goal)
+                # Penalize based on distance to the first elevator
                 max_moves = max(max_moves, 1 if elevator_here else 2)
             else:
-                # Already in elevator
+                # In elevator: 1 (EXIT) + 2 * remaining transfers
                 e_id = int(p_loc[1:])
                 e_idx = self.e_ids.index(e_id)
                 reach = self.elevator_specs[e_id]["reachable"]
                 
                 if goal in reach:
-                    unshareable += 1 # Only need to EXIT
+                    unshareable += 1
                     if state.elevatorsPosition[e_idx] != goal:
-                        max_moves = max(max_moves, 1) # Must move to goal floor
+                        max_moves = max(max_moves, 1)
                 else:
-                    # Must transfer: EXIT + (ENTER + EXIT) for each remaining leg
-                    best_remaining_transfers = min(self.min_transfers[f][goal] for f in reach)
-                    unshareable += 1 + 2 * (best_remaining_transfers + 1)
-                    max_moves = max(max_moves, 1) # Must move to transfer point
+                    best_remaining = self.best_transfer_from_e[e_id][p_weight][goal]
+                    if best_remaining == float('inf'): return float('inf')
+                    unshareable += 1 + 2 * (best_remaining + 1)
+                    max_moves = max(max_moves, 1)
                     
         return unshareable + max_moves
 

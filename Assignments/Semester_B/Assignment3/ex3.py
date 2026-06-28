@@ -33,7 +33,7 @@ class Controller:
         self.last_state = None
         
         # Hyperparameters
-        self.c_ucb = 50.0
+        self.c_ucb = 1
 
     def get_move_prob(self, e):
         return (self.move_success[e] + 1.0) / (self.move_attempts[e] + 2.0)
